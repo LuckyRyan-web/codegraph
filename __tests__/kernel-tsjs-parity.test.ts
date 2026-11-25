@@ -237,6 +237,34 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
     expect(result.nodes.some((n) => n.kind === 'function' && (n.name === 'b' || n.name === 'f'))).toBe(false);
   });
 
+  it('imported template interpolation and Apollo Query/Mutation resolver map parity', () => {
+    const templateSource = `import { fragA, fragB as localB } from './fragment';
+import * as ns from './ns-fragments';
+export const queryFn = (op: string) => ({
+  query: \`query \${op} { a { \${fragA} } b { \${localB} } c { \${ns.fragC} } }\`,
+});
+export const queryObj = {
+  query: \`query q { x { \${fragA} } }\`,
+};
+export const shadowed = (fragA: string) => \`\${fragA}\`;
+`;
+    assertParity('fixtures/template-interp.ts', templateSource, 'typescript');
+
+    const resolverSource = `const resolvers = {
+  Query: {
+    freeChartList: async (parent, args) => args,
+  },
+  Mutation: {
+    createNote: async () => ({ id: '1' }),
+  },
+};
+module.exports = resolvers;
+`;
+    const res = assertParity('fixtures/apollo-resolver.js', resolverSource, 'javascript');
+    expect(res.nodes.some((n) => n.kind === 'function' && n.name === 'freeChartList')).toBe(true);
+    expect(res.nodes.some((n) => n.kind === 'function' && n.name === 'createNote')).toBe(true);
+  });
+
   describe.each([
     ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
   ] as const)('a store exported by a later statement: %s', (ext, language) => {

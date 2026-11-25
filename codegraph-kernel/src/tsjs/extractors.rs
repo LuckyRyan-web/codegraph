@@ -723,7 +723,7 @@ impl<'t> Walker<'t> {
         // separator. The crate has no look-around, so the bounds consume.
         // ASCII classes, not `\w`: this crate's `\w` is Unicode, JS's is not.
         let pattern = format!(
-            r"(?mR)^[ \t]*export\s+(?:default\s+{n}\s*;?[ \t]*$|\{{(?:[^}}]*[^0-9A-Za-z_$}}])?{n}(?:[^0-9A-Za-z_$}}][^}}]*)?\}})",
+            r"(?mR)^[ \t]*(?:export\s+(?:default\s+{n}\s*;?[ \t]*$|\{{(?:[^}}]*[^0-9A-Za-z_$}}])?{n}(?:[^0-9A-Za-z_$}}][^}}]*)?\}})|module\.exports\s*=\s*{n}\s*;?[ \t]*$)",
             n = n
         );
         match regex::Regex::new(&pattern) {
@@ -821,8 +821,9 @@ impl<'t> Walker<'t> {
             // not (#2300): `const api = { load() {…} }` gives `api::load`. The
             // rest of the literal is walked under the owner (#693). Mirrors
             // the ownedObject branch of TreeSitterExtractor.extractVariable.
-            if let (Some(row), Some(obj)) = (var_row, self.owned_object_value(value)) {
-                self.extract_owned_object_members(obj, row, kind, &name, true, false, false);
+            let allow_nested = is_exported || self.is_exported_later(&name);
+            if let (Some(row), Some(obj)) = (var_row, self.owned_object_value(value, allow_nested)) {
+                self.extract_owned_object_members(obj, row, kind, &name, true, false, false, allow_nested);
                 walked.get_or_insert_with(HashSet::new).insert(obj.id());
                 continue;
             }
@@ -964,9 +965,32 @@ impl<'t> Walker<'t> {
         Some((value, util::object_key_name(self.text(key))))
     }
 
+    fn owned_nested_object_member(&self, member: Node<'t>) -> Option<Node<'t>> {
+        if member.kind() != "pair" {
+            return None;
+        }
+        let key = member.child_by_field_name("key")?;
+        let value = member.child_by_field_name("value")?;
+        if !is_static_object_key(key.kind()) || !matches!(value.kind(), "object" | "object_expression") {
+            return None;
+        }
+        let key_name = util::object_key_name(self.text(key));
+        if !matches!(key_name.as_str(), "Query" | "Mutation" | "Subscription") {
+            return None;
+        }
+        for i in 0..value.named_child_count() {
+            if let Some(inner) = value.named_child(i) {
+                if self.owned_member_function(inner).is_some() {
+                    return Some(value);
+                }
+            }
+        }
+        None
+    }
+
     /// ownedObjectValue: `value` when it is an object literal owning at least
-    /// one function member.
-    pub(super) fn owned_object_value(&self, value: Option<Node<'t>>) -> Option<Node<'t>> {
+    /// one function member (or, when `allow_nested`, a 1-level grouped object map).
+    pub(super) fn owned_object_value(&self, value: Option<Node<'t>>, allow_nested: bool) -> Option<Node<'t>> {
         let value = value?;
         if !matches!(value.kind(), "object" | "object_expression") || !self.owns_object_literals() {
             return None;
@@ -974,6 +998,9 @@ impl<'t> Walker<'t> {
         for i in 0..value.named_child_count() {
             if let Some(member) = value.named_child(i) {
                 if self.owned_member_function(member).is_some() {
+                    return Some(value);
+                }
+                if allow_nested && self.owned_nested_object_member(member).is_some() {
                     return Some(value);
                 }
             }
@@ -1000,7 +1027,17 @@ impl<'t> Walker<'t> {
     /// for a module-scope declaration (`values_under_owner`, #693), under the
     /// enclosing scope for a local or an assignment. The literal's shorthand
     /// members go to the function-as-value capture the same way.
-    fn extract_owned_object_members(&mut self, obj: Node<'t>, row: u32, kind: &'static str, name: &str, values_under_owner: bool, global: bool, exported: bool) {
+    fn extract_owned_object_members(
+        &mut self,
+        obj: Node<'t>,
+        row: u32,
+        kind: &'static str,
+        name: &str,
+        values_under_owner: bool,
+        global: bool,
+        exported: bool,
+        allow_nested: bool,
+    ) {
         let held = values_under_owner.then(|| self.enter_owner(row, kind, name, global));
         self.maybe_capture_fn_refs(obj);
         for i in 0..obj.named_child_count() {
@@ -1016,6 +1053,24 @@ impl<'t> Walker<'t> {
                     self.leave_owner(rest);
                 }
                 self.exported_member_fn = None;
+            } else if let Some(nested_obj) = allow_nested.then(|| self.owned_nested_object_member(member)).flatten() {
+                self.maybe_capture_fn_refs(nested_obj);
+                for j in 0..nested_obj.named_child_count() {
+                    let Some(inner) = nested_obj.named_child(j) else { continue };
+                    if let Some((func, member_name)) = self.owned_member_function(inner) {
+                        self.exported_member_fn = exported.then(|| func.id());
+                        if values_under_owner {
+                            self.extract_function(func, Some(member_name));
+                        } else {
+                            let rest = self.enter_owner(row, kind, name, global);
+                            self.extract_function(func, Some(member_name));
+                            self.leave_owner(rest);
+                        }
+                        self.exported_member_fn = None;
+                    } else {
+                        self.visit_function_body(inner);
+                    }
+                }
             } else {
                 self.visit_function_body(member);
             }
@@ -1033,7 +1088,7 @@ impl<'t> Walker<'t> {
         if name_node.kind() != "identifier" {
             return false;
         }
-        let Some(obj) = self.owned_object_value(declarator.child_by_field_name("value")) else {
+        let Some(obj) = self.owned_object_value(declarator.child_by_field_name("value"), false) else {
             return false;
         };
         let is_const = declarator.parent().map(|d| self.is_const_decl(d)).unwrap_or(false);
@@ -1049,7 +1104,7 @@ impl<'t> Walker<'t> {
         };
         let Some(row) = self.create_node(kind, &name, declarator, extra) else { return false };
         self.extract_variable_type_annotation(declarator, row);
-        self.extract_owned_object_members(obj, row, kind, &name, false, false, false);
+        self.extract_owned_object_members(obj, row, kind, &name, false, false, false, false);
         true
     }
 
@@ -1060,7 +1115,6 @@ impl<'t> Walker<'t> {
     /// path on the global object is global wherever it is written, so it is
     /// contained by the file. False (nothing extracted) for any other assignment.
     pub(super) fn extract_assigned_object_owner(&mut self, node: Node<'t>, module_level: bool) -> bool {
-        let Some(obj) = self.owned_object_value(node.child_by_field_name("right")) else { return false };
         let Some(path) = self.object_owner_path(node.child_by_field_name("left")) else { return false };
         // A plain name assigned at module level is a global (`dw_page = {…}`);
         // in a function it is a local being reassigned.
@@ -1068,6 +1122,8 @@ impl<'t> Walker<'t> {
             return false;
         }
         let qualified_name = (path.len() > 1).then(|| path.join("."));
+        let exported = qualified_name.as_deref() == Some("module.exports");
+        let Some(obj) = self.owned_object_value(node.child_by_field_name("right"), exported) else { return false };
         let global = path.len() > 1 && is_host_global_root(&path[0]);
         let rest = if global { self.stack.split_off(1) } else { Vec::new() };
         let statement = node.parent().filter(|p| p.kind() == "expression_statement").unwrap_or(node);
@@ -1084,11 +1140,10 @@ impl<'t> Walker<'t> {
         let row = self.create_node("variable", &name, node, extra);
         self.stack.extend(rest);
         let Some(row) = row else { return false };
-        let exported = qualified_name.as_deref() == Some("module.exports");
         if let Some(qualified_name) = qualified_name {
             self.object_path_owners.insert(row, qualified_name);
         }
-        self.extract_owned_object_members(obj, row, "variable", &name, false, global, exported);
+        self.extract_owned_object_members(obj, row, "variable", &name, false, global, exported, exported);
         true
     }
 
@@ -1453,7 +1508,7 @@ impl<'t> Walker<'t> {
         if self.looks_like_vue_store_file() && self.extract_store_collection_methods(value) {
             return true;
         }
-        let obj = if is_sfc_script_host(self.file_path) { None } else { self.owned_object_value(Some(value)) };
+        let obj = if is_sfc_script_host(self.file_path) { None } else { self.owned_object_value(Some(value), true) };
         let Some(obj) = obj else { return self.looks_like_vue_store_file() };
         let extra = Extra {
             docstring: crate::docstring::preceding_docstring(statement, self.src),
@@ -1464,7 +1519,7 @@ impl<'t> Walker<'t> {
         let Some(row) = self.create_node("constant", "default", statement, extra) else {
             return self.looks_like_vue_store_file();
         };
-        self.extract_owned_object_members(obj, row, "constant", "default", true, false, false);
+        self.extract_owned_object_members(obj, row, "constant", "default", true, false, false, true);
         true
     }
 
@@ -1695,6 +1750,7 @@ impl<'t> Walker<'t> {
             if name.is_empty() {
                 return;
             }
+            w.import_binding_names.insert(name.clone());
             w.push_ref(from_row, &name, imports_kind, n);
         };
 

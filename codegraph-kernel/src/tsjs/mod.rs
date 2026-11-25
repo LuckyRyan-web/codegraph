@@ -213,6 +213,9 @@ pub struct Walker<'t> {
     defined_fn_names: HashSet<String>,
     /// Simple names from `imports` refs (fn-ref flush gate).
     imported_names: HashSet<String>,
+    /// Local binding names introduced by `import_statement` clauses (excluding
+    /// module specifiers) — feeds flush_imported_template_refs.
+    import_binding_names: HashSet<String>,
     fn_ref_cands: Vec<(u32, fnref::Candidate)>,
     // Value-reference bookkeeping (flushValueRefs).
     fs_values: HashMap<String, u32>,
@@ -275,6 +278,7 @@ pub fn extract(file_path: &str, source: &str, language: &str) -> Result<EmitOut,
         node_ids: Vec::new(),
         defined_fn_names: HashSet::new(),
         imported_names: HashSet::new(),
+        import_binding_names: HashSet::new(),
         fn_ref_cands: Vec::new(),
         fs_values: HashMap::new(),
         fs_value_counts: HashMap::new(),
@@ -320,6 +324,7 @@ pub fn extract(file_path: &str, source: &str, language: &str) -> Result<EmitOut,
 
     // End-of-file passes, in the TS extract() order.
     w.flush_fn_ref_candidates();
+    w.flush_imported_template_refs();
     w.flush_value_refs(tree.root_node());
     w.stack.pop();
 
@@ -522,6 +527,152 @@ impl<'t> Walker<'t> {
         // does (`${BaseMenuItemCSS}` in a styled template).
         if matches!(kind, "function" | "method" | "constant" | "variable" | "component") {
             self.value_scopes.push(ValueScope { row, node, name: name.to_string() });
+        }
+    }
+
+    fn flush_imported_template_refs(&mut self) {
+        let imported = std::mem::take(&mut self.import_binding_names);
+        if imported.is_empty() || self.value_scopes.is_empty() || util::is_generated_file(self.file_path) {
+            return;
+        }
+
+        let scope_keys: HashSet<(usize, usize)> = self
+            .value_scopes
+            .iter()
+            .map(|s| (s.node.start_byte(), s.node.end_byte()))
+            .collect();
+
+        let refs_kind = edge_kind_index("references").unwrap();
+        let scopes: Vec<(u32, Node<'t>)> = self.value_scopes.iter().map(|s| (s.row, s.node)).collect();
+
+        let collect_pattern_ids = |pat: Node<'t>, src: &str, imported: &HashSet<String>, out: &mut HashSet<String>| {
+            let mut pstack: Vec<Node<'t>> = vec![pat];
+            let mut pvisited = 0usize;
+            while let Some(pn) = pstack.pop() {
+                if pvisited >= 256 {
+                    break;
+                }
+                pvisited += 1;
+                match pn.kind() {
+                    "identifier" => {
+                        let nm = &src[pn.byte_range()];
+                        if imported.contains(nm) {
+                            out.insert(nm.to_string());
+                        }
+                        continue;
+                    }
+                    "assignment_pattern" => {
+                        if let Some(left) = pn.child_by_field_name("left").or_else(|| pn.named_child(0)) {
+                            pstack.push(left);
+                        }
+                        continue;
+                    }
+                    "pair_pattern" => {
+                        if let Some(val) = pn.child_by_field_name("value") {
+                            pstack.push(val);
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+                for i in 0..pn.named_child_count() {
+                    if let Some(c) = pn.named_child(i) {
+                        pstack.push(c);
+                    }
+                }
+            }
+        };
+
+        for (scope_row, scope_node) in scopes {
+            let self_key = (scope_node.start_byte(), scope_node.end_byte());
+            let mut local_shadows: HashSet<String> = HashSet::new();
+            let mut sstack: Vec<Node<'t>> = vec![scope_node];
+            let mut svisited = 0usize;
+            while let Some(n) = sstack.pop() {
+                if svisited >= MAX_VALUE_REF_NODES {
+                    break;
+                }
+                svisited += 1;
+                let key = (n.start_byte(), n.end_byte());
+                let is_self = key == self_key;
+                if !is_self && scope_keys.contains(&key) {
+                    continue;
+                }
+                match n.kind() {
+                    "formal_parameters" => collect_pattern_ids(n, self.src, &imported, &mut local_shadows),
+                    "arrow_function" => {
+                        if let Some(p) = n.child_by_field_name("parameter") {
+                            collect_pattern_ids(p, self.src, &imported, &mut local_shadows);
+                        }
+                    }
+                    "variable_declarator" if !is_self => {
+                        if let Some(name_node) = n.child_by_field_name("name").or_else(|| n.named_child(0)) {
+                            collect_pattern_ids(name_node, self.src, &imported, &mut local_shadows);
+                        }
+                    }
+                    _ => {}
+                }
+                for i in 0..n.named_child_count() {
+                    if let Some(c) = n.named_child(i) {
+                        sstack.push(c);
+                    }
+                }
+            }
+
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut stack: Vec<(Node<'t>, bool)> = vec![(scope_node, false)];
+            let mut visited = 0usize;
+            while let Some((n, in_sub)) = stack.pop() {
+                if visited >= MAX_VALUE_REF_NODES {
+                    break;
+                }
+                visited += 1;
+                let key = (n.start_byte(), n.end_byte());
+                let is_self = key == self_key;
+                if !is_self && scope_keys.contains(&key) {
+                    continue;
+                }
+
+                let now_in_sub = in_sub || n.kind() == "template_substitution";
+                if in_sub && n.kind() == "identifier" {
+                    let name = self.text(n);
+                    if imported.contains(name) && !local_shadows.contains(name) {
+                        let parent = n.parent();
+                        let is_decl_name = parent
+                            .filter(|p| p.kind() == "variable_declarator")
+                            .and_then(|p| p.child_by_field_name("name"))
+                            .map(|nm| nm.start_byte() == n.start_byte())
+                            .unwrap_or(false);
+                        if !is_decl_name {
+                            let mut ref_name = name.to_string();
+                            if let Some(p) = parent {
+                                if p.kind() == "member_expression" {
+                                    if let (Some(obj), Some(prop)) =
+                                        (p.child_by_field_name("object"), p.child_by_field_name("property"))
+                                    {
+                                        if obj.start_byte() == n.start_byte()
+                                            && obj.end_byte() == n.end_byte()
+                                            && prop.kind() == "property_identifier"
+                                        {
+                                            ref_name = format!("{}.{}", name, self.text(prop));
+                                        }
+                                    }
+                                }
+                            }
+                            if seen.insert(ref_name.clone()) {
+                                self.push_ref(scope_row, &ref_name, refs_kind, n);
+                            }
+                        }
+                    }
+                }
+
+                let count = n.named_child_count();
+                for i in (0..count).rev() {
+                    if let Some(c) = n.named_child(i) {
+                        stack.push((c, now_in_sub));
+                    }
+                }
+            }
         }
     }
 

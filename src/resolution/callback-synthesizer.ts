@@ -28,6 +28,8 @@ import { isGeneratedFile } from '../extraction/generated-detection';
 import { stripCommentsForRegex } from './strip-comments';
 import { escapeRegExp } from '../utils';
 import { cFnPointerDispatchEdges } from './c-fnptr-synthesizer';
+import { graphqlResolverEdges } from './graphql-synthesizer';
+import { extractPugComponentTags } from '../extraction/vue-extractor';
 import { cppTemplateArgumentEdges } from './cpp-template-instantiations';
 import { goframeRouteEdges } from './goframe-synthesizer';
 import { goFuncFieldEdges } from './go-func-field-synthesizer';
@@ -2770,8 +2772,12 @@ async function vueTemplateEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
     if ((++scannedFiles & 15) === 0) await onYield();
     if (!file.endsWith('.vue')) continue;
     const content = ctx.readFile(file);
-    const tpl = content && content.match(/<template[^>]*>([\s\S]*)<\/template>/i)?.[1];
+    if (!content) continue;
+    const tplMatch = content.match(/<template(\s[^>]*)?>([\s\S]*)<\/template>/i);
+    const tplAttrs = tplMatch?.[1] ?? '';
+    const tpl = tplMatch?.[2];
     if (!tpl) continue;
+    const isPug = /\blang\s*=\s*["']pug["']/i.test(tplAttrs);
     const comp = ctx.getNodesInFile(file).find((n) => n.kind === 'component');
     if (!comp) continue;
 
@@ -2800,31 +2806,42 @@ async function vueTemplateEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
       edges.push({ source: comp.id, target: target.id, kind: 'calls', line: comp.startLine, provenance: 'heuristic', metadata: meta });
       added++;
     };
-    // Prefer a target in THIS SFC (handlers live in the same file's script) —
-    // avoids cross-file mis-match when a name repeats across a monorepo. A name
-    // the SFC imports from a package (`import { NButton } from 'naive-ui'`) is
-    // the package's: no other project symbol, nor a Nuxt auto-imported
-    // component (`fallback`), is what it renders or calls.
+    const filePkg = file.replace(/\\/g, '/').match(/(?:^|\/)(?:packages|apps)\/([^/]+)\//)?.[1] ?? null;
+    // Prefer a target in THIS SFC (handlers live in the same file's script),
+    // then same monorepo package — avoids cross-package mis-match in monorepos.
     const resolve = (name: string, kinds: Set<string>, fallback?: Node): Node | undefined => {
       const matches = ctx.getNodesByName(name).filter((n) => kinds.has(n.kind) && !isManualMockHiddenFrom(n.filePath, file));
       const local = matches.find((n) => n.filePath === file);
       if (local || importedFromPackage(ctx, name, file)) return local;
+      if (filePkg && matches.length > 1) {
+        const pkgSeg = `/${filePkg}/`;
+        const inPkg = matches.find((n) => n.filePath.replace(/\\/g, '/').includes(pkgSeg));
+        if (inPkg) return inPkg;
+      }
       return matches[0] ?? fallback;
     };
+    const resolveTag = (pascal: string, raw: string): Node | undefined =>
+      resolve(pascal, COMPONENT_KINDS, raw !== pascal ? resolve(raw, COMPONENT_KINDS, nuxtComponents.get(pascal)) : nuxtComponents.get(pascal));
 
     let m: RegExpExecArray | null;
-    VUE_KEBAB_RE.lastIndex = 0;
-    while ((m = VUE_KEBAB_RE.exec(tpl))) {
-      const tag = kebabToPascal(m[1]!);
-      addEdge(resolve(tag, COMPONENT_KINDS, nuxtComponents.get(tag)), { synthesizedBy: 'jsx-render', via: m[1] });
-    }
-    // PascalCase component tags. Try a direct name match first (flat components
-    // and explicit registrations), then the Nuxt dir-prefixed auto-import name
-    // (`<MediaCard>` → components/media/Card.vue). Built-ins match neither → no edge.
-    VUE_PASCAL_RE.lastIndex = 0;
-    while ((m = VUE_PASCAL_RE.exec(tpl))) {
-      const tag = m[1]!;
-      addEdge(resolve(tag, COMPONENT_KINDS, nuxtComponents.get(tag)), { synthesizedBy: 'jsx-render', via: tag });
+    if (isPug) {
+      for (const pt of extractPugComponentTags(tpl, 0)) {
+        addEdge(resolveTag(pt.componentName, pt.rawName), { synthesizedBy: 'jsx-render', via: pt.rawName });
+      }
+    } else {
+      VUE_KEBAB_RE.lastIndex = 0;
+      while ((m = VUE_KEBAB_RE.exec(tpl))) {
+        const tag = kebabToPascal(m[1]!);
+        addEdge(resolveTag(tag, m[1]!), { synthesizedBy: 'jsx-render', via: m[1] });
+      }
+      // PascalCase component tags. Try a direct name match first (flat components
+      // and explicit registrations), then the Nuxt dir-prefixed auto-import name
+      // (`<MediaCard>` → components/media/Card.vue). Built-ins match neither → no edge.
+      VUE_PASCAL_RE.lastIndex = 0;
+      while ((m = VUE_PASCAL_RE.exec(tpl))) {
+        const tag = m[1]!;
+        addEdge(resolveTag(tag, tag), { synthesizedBy: 'jsx-render', via: tag });
+      }
     }
     VUE_HANDLER_RE.lastIndex = 0;
     while ((m = VUE_HANDLER_RE.exec(tpl))) {
@@ -5422,6 +5439,7 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   { name: 'svelteKitPageEdges', gate: (has) => has('svelte'), run: (_q, c, y) => svelteKitPageComponentEdges(c, y) },
   { name: 'svelteKitLinkEdges', gate: (has) => has('svelte'), run: (_q, c, y) => svelteKitLinkEdges(c, y) },
   { name: 'nixOptionEdges', gate: (has) => has('nix'), run: (q, _c, y) => nixOptionPathEdges(q, y) },
+  { name: 'graphqlResolverEdges', gate: (has) => has('vue', ...JS_FAMILY), run: (_q, c, y) => graphqlResolverEdges(c, y) },
 ];
 
 /**

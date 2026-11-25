@@ -29,6 +29,174 @@ function kebabToPascal(name: string): string {
     .join('');
 }
 
+const NATIVE_HTML_TAGS = new Set([
+  'a', 'abbr', 'address', 'area', 'article', 'aside', 'audio',
+  'b', 'base', 'bdi', 'bdo', 'blockquote', 'body', 'br', 'button',
+  'canvas', 'caption', 'cite', 'code', 'col', 'colgroup',
+  'data', 'datalist', 'dd', 'del', 'details', 'dfn', 'dialog', 'div', 'dl', 'dt',
+  'em', 'embed',
+  'fieldset', 'figcaption', 'figure', 'footer', 'form',
+  'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'head', 'header', 'hgroup', 'hr', 'html',
+  'i', 'iframe', 'img', 'input', 'ins',
+  'kbd', 'label', 'legend', 'li', 'link',
+  'main', 'map', 'mark', 'menu', 'meta', 'meter',
+  'nav', 'noscript', 'object', 'ol', 'optgroup', 'option', 'output',
+  'p', 'param', 'picture', 'pre', 'progress',
+  'q', 'rp', 'rt', 'ruby',
+  's', 'samp', 'script', 'section', 'select', 'slot', 'small', 'source', 'span',
+  'strong', 'style', 'sub', 'summary', 'sup', 'svg',
+  'table', 'tbody', 'td', 'template', 'textarea', 'tfoot', 'th', 'thead', 'time', 'title', 'tr', 'track',
+  'u', 'ul', 'var', 'video', 'wbr',
+  // Pug control-flow / structural keywords
+  'if', 'else', 'unless', 'case', 'when', 'default', 'each', 'for', 'while',
+  'block', 'extends', 'include', 'mixin', 'append', 'prepend', 'doctype',
+]);
+
+export interface TemplateComponentTag {
+  rawName: string;
+  componentName: string;
+  line: number;
+  column: number;
+}
+
+/**
+ * Scan a Pug `<template lang="pug">` body and extract Vue component usages.
+ * Tracks parenthesis depth across multi-line attribute lists and Pug comment
+ * blocks so attribute names (`v-else-if`, `pop-class`) are never mistaken for tags.
+ */
+export function extractPugComponentTags(
+  pugContent: string,
+  startLineOffset: number,
+  importedNames?: ReadonlySet<string>
+): TemplateComponentTag[] {
+  const results: TemplateComponentTag[] = [];
+  const lines = pugContent.split('\n');
+  let parenDepth = 0;
+  let commentIndent: number | null = null;
+
+  const classifyTag = (raw: string): string | null => {
+    let componentName: string;
+    if (/^[A-Z]/.test(raw)) {
+      componentName = raw;
+    } else if (raw.includes('-')) {
+      componentName = kebabToPascal(raw);
+    } else if (importedNames && !NATIVE_HTML_TAGS.has(raw)) {
+      const pascal = raw[0]!.toUpperCase() + raw.slice(1);
+      if (!importedNames.has(pascal)) return null;
+      componentName = pascal;
+    } else {
+      return null;
+    }
+    if (VUE_BUILTIN_COMPONENTS.has(componentName)) return null;
+    return componentName;
+  };
+
+  const scanLine = (line: string, startCol: number, collectBlockExpansions: boolean): Array<{ raw: string; col: number }> => {
+    const expansions: Array<{ raw: string; col: number }> = [];
+    let quote: string | null = null;
+    for (let i = startCol; i < line.length; i++) {
+      const ch = line[i]!;
+      if (quote) {
+        if (ch === '\\') {
+          i++;
+          continue;
+        }
+        if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === "'" || ch === '"' || ch === '`') {
+        quote = ch;
+        continue;
+      }
+      if (ch === '(') {
+        parenDepth++;
+        continue;
+      }
+      if (ch === ')') {
+        if (parenDepth > 0) parenDepth--;
+        continue;
+      }
+      if (collectBlockExpansions && parenDepth === 0 && ch === ':' && line[i + 1] === ' ') {
+        let j = i + 2;
+        while (j < line.length && (line[j] === ' ' || line[j] === '\t')) j++;
+        const rest = line.slice(j);
+        const em = rest.match(/^([A-Za-z][A-Za-z0-9_-]*)(?=[\s.(#/:]|$)/);
+        if (em) {
+          expansions.push({ raw: em[1]!, col: j });
+          i = j + em[1]!.length - 1;
+        }
+      }
+    }
+    return expansions;
+  };
+
+  for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+    const line = lines[lineIdx]!;
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    const indent = line.length - line.trimStart().length;
+
+    if (parenDepth > 0) {
+      scanLine(line, 0, false);
+      continue;
+    }
+
+    if (commentIndent !== null) {
+      if (indent > commentIndent) continue;
+      commentIndent = null;
+    }
+
+    if (trimmed.startsWith('//')) {
+      commentIndent = indent;
+      continue;
+    }
+
+    const startsWithNonTag =
+      trimmed.startsWith('|') ||
+      trimmed.startsWith('-') ||
+      trimmed.startsWith('=') ||
+      trimmed.startsWith('!=') ||
+      trimmed.startsWith('<');
+    if (startsWithNonTag) {
+      continue;
+    }
+
+    let scanStart = indent;
+    if (!trimmed.startsWith('.') && !trimmed.startsWith('#')) {
+      const m = trimmed.match(/^([A-Za-z][A-Za-z0-9_-]*)(?=[\s.(#/:]|$)/);
+      if (m) {
+        const raw = m[1]!;
+        const componentName = classifyTag(raw);
+        if (componentName) {
+          results.push({
+            rawName: raw,
+            componentName,
+            line: startLineOffset + lineIdx + 1,
+            column: indent + 1,
+          });
+        }
+        scanStart = indent + raw.length;
+      }
+    }
+
+    const expansions = scanLine(line, scanStart, true);
+    for (const exp of expansions) {
+      const componentName = classifyTag(exp.raw);
+      if (componentName) {
+        results.push({
+          rawName: exp.raw,
+          componentName,
+          line: startLineOffset + lineIdx + 1,
+          column: exp.col + 1,
+        });
+      }
+    }
+  }
+
+  return results;
+}
+
 /**
  * VueExtractor - Extracts code relationships from Vue Single-File Component files
  *
@@ -45,6 +213,7 @@ export class VueExtractor {
   private edges: Edge[] = [];
   private unresolvedReferences: UnresolvedReference[] = [];
   private errors: ExtractionError[] = [];
+  private scriptImportedPascalNames = new Set<string>();
 
   constructor(filePath: string, source: string) {
     this.filePath = filePath;
@@ -266,6 +435,12 @@ export class VueExtractor {
     // part of the file. Name each one, and hand it the calls written inside it.
     if (!block.isSetup) this.addOptionsMembers(block, result, componentNodeId);
 
+    for (const ref of result.unresolvedReferences) {
+      if (ref.referenceKind === 'imports' && /^[A-Z][A-Za-z0-9_]*$/.test(ref.referenceName)) {
+        this.scriptImportedPascalNames.add(ref.referenceName);
+      }
+    }
+
     foldScriptResult(
       result,
       { filePath: this.filePath, componentNodeId, lineOffset: block.startLine, language: 'vue', perInstance: block.isSetup },
@@ -296,6 +471,42 @@ export class VueExtractor {
     const coveredRanges = sfcBlockLineRanges(this.source);
 
     const lines = this.source.split('\n');
+
+    // Detect `<template lang="pug">` — Pug templates omit angle brackets
+    // (`ad-playable(:data="list")`), so the HTML `<tag>` regex below would
+    // miss every child component.
+    const tplOpenRegex = /<template(\s[^>]*)?>/gi;
+    let pugHandled = false;
+    let tplMatch: RegExpExecArray | null;
+    while ((tplMatch = tplOpenRegex.exec(this.source)) !== null) {
+      const openLine = (this.source.substring(0, tplMatch.index).match(/\n/g) || []).length;
+      if (coveredRanges.some(([start, end]) => openLine >= start && openLine <= end)) continue;
+      const attrs = tplMatch[1] || '';
+      if (!/\blang\s*=\s*["']pug["']/i.test(attrs)) continue;
+
+      const contentStart = tplMatch.index + tplMatch[0].length;
+      const closeIdx = this.source.indexOf('</template>', contentStart);
+      if (closeIdx === -1) continue;
+
+      const pugBody = this.source.substring(contentStart, closeIdx);
+      const startLineOffset = (this.source.substring(0, contentStart).match(/\n/g) || []).length;
+      const pugTags = extractPugComponentTags(pugBody, startLineOffset, this.scriptImportedPascalNames);
+      for (const tag of pugTags) {
+        this.unresolvedReferences.push({
+          fromNodeId: componentNodeId,
+          referenceName: tag.componentName,
+          referenceKind: 'references',
+          line: tag.line,
+          column: tag.column,
+          filePath: this.filePath,
+          language: 'vue',
+        });
+      }
+      pugHandled = true;
+      break;
+    }
+    if (pugHandled) return;
+
     // Opening / self-closing tags (closing `</Foo>` starts with `</`, so the
     // leading `<` followed by a name letter won't match it).
     const tagRegex = /<([A-Za-z][A-Za-z0-9_-]*)\b/g;
@@ -312,6 +523,10 @@ export class VueExtractor {
           componentName = raw; // PascalCase component
         } else if (raw.includes('-')) {
           componentName = kebabToPascal(raw); // kebab-case component
+        } else if (!NATIVE_HTML_TAGS.has(raw)) {
+          const pascal = raw[0]!.toUpperCase() + raw.slice(1);
+          if (!this.scriptImportedPascalNames.has(pascal)) continue;
+          componentName = pascal;
         } else {
           continue; // lowercase, no hyphen → native HTML element
         }

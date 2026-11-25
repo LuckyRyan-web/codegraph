@@ -902,6 +902,10 @@ export class TreeSitterExtractor {
   private fileScopeValues = new Map<string, string>();
   private fileScopeValueCounts = new Map<string, number>(); // file-scope nodes per name (conditional-def detection)
   private valueRefScopes: Array<{ id: string; node: SyntaxNode; name: string }> = [];
+  // Local binding names introduced by JS/TS `import` statements (excluding
+  // module specifiers), used to emit cross-file `references` edges when an
+  // imported symbol is interpolated inside a template literal `${...}`.
+  private importBindingNames = new Set<string>();
   private errors: ExtractionError[] = [];
   // Import nodes made for `export … from` statements: no symbols of the file's own.
   private reExportImports = 0;
@@ -1129,6 +1133,7 @@ export class TreeSitterExtractor {
       // Gate + flush function-as-value candidates (#756) while the file's
       // nodes and import refs are complete and the file node is still pushed.
       this.flushFnRefCandidates();
+      this.flushImportedTemplateRefs();
       this.flushValueRefs();
       this.flushPascalReads();
 
@@ -1410,6 +1415,139 @@ export class TreeSitterExtractor {
    * function_ref), deduped per (reader, target). Default on (CODEGRAPH_VALUE_REFS=0 disables) +
    * additive. Shadowed targets are pruned — see below.
    */
+  /**
+   * Emit cross-file `references` unresolved refs when a JS/TS symbol imported
+   * from another module is interpolated inside a template literal (`${X}` or
+   * `${ns.X}`), attributed to the innermost enclosing function/method/constant/
+   * variable/component scope.
+   */
+  private flushImportedTemplateRefs(): void {
+    const imported = this.importBindingNames;
+    this.importBindingNames = new Set();
+    if (
+      this.language !== 'typescript' &&
+      this.language !== 'tsx' &&
+      this.language !== 'javascript' &&
+      this.language !== 'jsx' &&
+      this.language !== 'arkts'
+    ) {
+      return;
+    }
+    const scopes = this.valueRefScopes;
+    if (imported.size === 0 || scopes.length === 0 || isGeneratedFile(this.filePath)) return;
+
+    const nodeKey = (n: SyntaxNode): string => `${n.startIndex}:${n.endIndex}`;
+    const scopeKeys = new Set<string>();
+    for (const s of scopes) scopeKeys.add(nodeKey(s.node));
+
+    const collectPatternIds = (pat: SyntaxNode | null, out: Set<string>): void => {
+      if (!pat) return;
+      const pstack: SyntaxNode[] = [pat];
+      let pvisited = 0;
+      while (pstack.length > 0 && pvisited < 256) {
+        const pn = pstack.pop()!;
+        pvisited++;
+        if (pn.type === 'identifier') {
+          const nm = getNodeText(pn, this.source);
+          if (imported.has(nm)) out.add(nm);
+          continue;
+        }
+        if (pn.type === 'assignment_pattern') {
+          const left = getChildByField(pn, 'left') ?? pn.namedChild(0);
+          if (left) pstack.push(left);
+          continue;
+        }
+        if (pn.type === 'pair_pattern') {
+          const val = getChildByField(pn, 'value');
+          if (val) pstack.push(val);
+          continue;
+        }
+        for (let i = 0; i < pn.namedChildCount; i++) {
+          const c = pn.namedChild(i);
+          if (c) pstack.push(c);
+        }
+      }
+    };
+
+    for (const scope of scopes) {
+      const selfKey = nodeKey(scope.node);
+      const localShadows = new Set<string>();
+      const sstack: SyntaxNode[] = [scope.node];
+      let svisited = 0;
+      while (sstack.length > 0 && svisited < TreeSitterExtractor.MAX_VALUE_REF_NODES) {
+        const n = sstack.pop()!;
+        svisited++;
+        const isSelf = nodeKey(n) === selfKey;
+        if (!isSelf && scopeKeys.has(nodeKey(n))) continue;
+        if (n.type === 'formal_parameters') {
+          collectPatternIds(n, localShadows);
+        } else if (n.type === 'arrow_function') {
+          const singleParam = getChildByField(n, 'parameter');
+          if (singleParam) collectPatternIds(singleParam, localShadows);
+        } else if (n.type === 'variable_declarator' && !isSelf) {
+          const nameNode = getChildByField(n, 'name') ?? n.namedChild(0);
+          if (nameNode) collectPatternIds(nameNode, localShadows);
+        }
+        for (let i = 0; i < n.namedChildCount; i++) {
+          const c = n.namedChild(i);
+          if (c) sstack.push(c);
+        }
+      }
+
+      const seen = new Set<string>();
+      const stack: Array<{ n: SyntaxNode; inSub: boolean }> = [{ n: scope.node, inSub: false }];
+      let visited = 0;
+      while (stack.length > 0 && visited < TreeSitterExtractor.MAX_VALUE_REF_NODES) {
+        const item = stack.pop()!;
+        const n = item.n;
+        visited++;
+        const isSelf = nodeKey(n) === selfKey;
+        if (!isSelf && scopeKeys.has(nodeKey(n))) continue;
+
+        const nowInSub = item.inSub || n.type === 'template_substitution';
+        if (item.inSub && n.type === 'identifier') {
+          const name = getNodeText(n, this.source);
+          if (imported.has(name) && !localShadows.has(name)) {
+            const parent = n.parent;
+            const isDeclName =
+              parent?.type === 'variable_declarator' &&
+              getChildByField(parent, 'name')?.startIndex === n.startIndex;
+            if (!isDeclName) {
+              let refName = name;
+              if (parent?.type === 'member_expression') {
+                const obj = getChildByField(parent, 'object');
+                const prop = getChildByField(parent, 'property');
+                if (
+                  obj &&
+                  obj.startIndex === n.startIndex &&
+                  obj.endIndex === n.endIndex &&
+                  prop?.type === 'property_identifier'
+                ) {
+                  refName = `${name}.${getNodeText(prop, this.source)}`;
+                }
+              }
+              if (!seen.has(refName)) {
+                seen.add(refName);
+                this.unresolvedReferences.push({
+                  fromNodeId: scope.id,
+                  referenceName: refName,
+                  referenceKind: 'references',
+                  line: n.startPosition.row + 1,
+                  column: n.startPosition.column,
+                });
+              }
+            }
+          }
+        }
+
+        for (let i = n.namedChildCount - 1; i >= 0; i--) {
+          const c = n.namedChild(i);
+          if (c) stack.push({ n: c, inSub: nowInSub });
+        }
+      }
+    }
+  }
+
   private flushValueRefs(): void {
     const scopes = this.valueRefScopes;
     const targets = this.fileScopeValues;
@@ -3573,12 +3711,30 @@ export class TreeSitterExtractor {
     return { fn: value, name: this.objectKeyName(key) };
   }
 
-  /** `value` when it is an object literal that owns at least one function member, else null. */
-  private ownedObjectValue(value: SyntaxNode | null): SyntaxNode | null {
+  /** A GraphQL root-operation resolver group (`Query: { ... }`, `Mutation: { ... }`, `Subscription: { ... }`) whose object literal owns at least one function member. Scoped to those exact keys so arbitrary nested objects (`nested: { inner() {} }`) keep #3393's depth-1 boundary. */
+  private ownedNestedObjectMember(member: SyntaxNode): SyntaxNode | null {
+    if (member.type !== 'pair') return null;
+    const key = getChildByField(member, 'key');
+    const value = getChildByField(member, 'value');
+    if (!key || !value || !STATIC_OBJECT_KEY_TYPES.has(key.type)) return null;
+    const keyName = this.objectKeyName(key);
+    if (keyName !== 'Query' && keyName !== 'Mutation' && keyName !== 'Subscription') return null;
+    if (value.type !== 'object' && value.type !== 'object_expression') return null;
+    for (let i = 0; i < value.namedChildCount; i++) {
+      const inner = value.namedChild(i);
+      if (inner && this.ownedMemberFunction(inner)) return value;
+    }
+    return null;
+  }
+
+  /** `value` when it is an object literal that owns at least one function member (or, when `allowNested`, a 1-level grouped object map like Apollo `{ Query: { ... } }`), else null. */
+  private ownedObjectValue(value: SyntaxNode | null, allowNested = false): SyntaxNode | null {
     if (!value || (value.type !== 'object' && value.type !== 'object_expression') || !this.ownsObjectLiterals()) return null;
     for (let i = 0; i < value.namedChildCount; i++) {
       const member = value.namedChild(i);
-      if (member && this.ownedMemberFunction(member)) return value;
+      if (!member) continue;
+      if (this.ownedMemberFunction(member)) return value;
+      if (allowNested && this.ownedNestedObjectMember(member)) return value;
     }
     return null;
   }
@@ -3592,9 +3748,11 @@ export class TreeSitterExtractor {
    * are the constant's, #693), under the enclosing function for a local or an
    * assignment, as they were before members had nodes. The literal's shorthand
    * members (`{ load }`) go to the function-as-value capture the same way. The
-   * members of the module's export object (`exported`) are exported.
+   * members of the module's export object (`exported`) are exported. When
+   * `allowNested` is true (exported grouped maps like Apollo resolvers), a
+   * static-keyed nested object's function members are extracted one level down.
    */
-  private extractOwnedObjectMembers(obj: SyntaxNode, ownerId: string, valuesUnderOwner: boolean, global: boolean, exported = false): void {
+  private extractOwnedObjectMembers(obj: SyntaxNode, ownerId: string, valuesUnderOwner: boolean, global: boolean, exported = false, allowNested = false): void {
     const enclosing = this.nodeStack;
     const ownerStack = [...(global ? enclosing.slice(0, 1) : enclosing), ownerId];
     const valueStack = valuesUnderOwner ? ownerStack : enclosing;
@@ -3604,14 +3762,34 @@ export class TreeSitterExtractor {
       const member = obj.namedChild(i);
       if (!member) continue;
       const owned = this.ownedMemberFunction(member);
-      this.nodeStack = owned ? ownerStack : valueStack;
       if (owned) {
+        this.nodeStack = ownerStack;
         this.exportedMemberFn = exported ? owned.fn.id : null;
         this.extractFunction(owned.fn, owned.name);
         this.exportedMemberFn = null;
-      } else {
-        this.visitFunctionBody(member, '');
+        continue;
       }
+      const nestedObj = allowNested ? this.ownedNestedObjectMember(member) : null;
+      if (nestedObj) {
+        this.nodeStack = valueStack;
+        this.maybeCaptureFnRefs(nestedObj, nestedObj.type);
+        for (let j = 0; j < nestedObj.namedChildCount; j++) {
+          const inner = nestedObj.namedChild(j);
+          if (!inner) continue;
+          const innerOwned = this.ownedMemberFunction(inner);
+          this.nodeStack = innerOwned ? ownerStack : valueStack;
+          if (innerOwned) {
+            this.exportedMemberFn = exported ? innerOwned.fn.id : null;
+            this.extractFunction(innerOwned.fn, innerOwned.name);
+            this.exportedMemberFn = null;
+          } else {
+            this.visitFunctionBody(inner, '');
+          }
+        }
+        continue;
+      }
+      this.nodeStack = valueStack;
+      this.visitFunctionBody(member, '');
     }
     this.nodeStack = enclosing;
   }
@@ -3659,13 +3837,14 @@ export class TreeSitterExtractor {
    * assignment.
    */
   private extractAssignedObjectOwner(node: SyntaxNode, moduleLevel: boolean): boolean {
-    const obj = this.ownedObjectValue(getChildByField(node, 'right'));
-    if (!obj) return false;
     const path = this.objectOwnerPath(getChildByField(node, 'left'));
     // A plain name assigned at module level is a global (`dw_page = {…}`); in
     // a function it is a local being reassigned (`e = {…}` in a bundle's IIFE).
     if (!path || (path.length === 1 && !moduleLevel)) return false;
     const qualifiedName = path.length > 1 ? path.join('.') : undefined;
+    const isModuleExports = qualifiedName === 'module.exports';
+    const obj = this.ownedObjectValue(getChildByField(node, 'right'), isModuleExports);
+    if (!obj) return false;
     const global = path.length > 1 && HOST_GLOBAL_ROOTS.has(path[0]!);
     const saved = this.nodeStack;
     if (global) this.nodeStack = saved.slice(0, 1);
@@ -3682,7 +3861,7 @@ export class TreeSitterExtractor {
     this.nodeStack = saved;
     if (!owner) return false;
     if (qualifiedName !== undefined) this.objectPathOwners.set(owner.id, qualifiedName);
-    this.extractOwnedObjectMembers(obj, owner.id, false, global, qualifiedName === 'module.exports');
+    this.extractOwnedObjectMembers(obj, owner.id, false, global, isModuleExports, isModuleExports);
     return true;
   }
 
@@ -3711,7 +3890,7 @@ export class TreeSitterExtractor {
     const value = getChildByField(statement, 'value');
     if (value?.type !== 'object' && value?.type !== 'object_expression') return false;
     if (this.looksLikeVueStoreFile() && this.extractStoreCollectionMethods(value)) return true;
-    const obj = SFC_SCRIPT_HOST_FILE.test(this.filePath) ? null : this.ownedObjectValue(value);
+    const obj = SFC_SCRIPT_HOST_FILE.test(this.filePath) ? null : this.ownedObjectValue(value, true);
     if (!obj) return this.looksLikeVueStoreFile();
     const initValue = getNodeText(obj, this.source).slice(0, 100);
     const owner = this.createNode('constant', 'default', statement, {
@@ -3720,7 +3899,7 @@ export class TreeSitterExtractor {
       isExported: true,
     });
     if (!owner) return this.looksLikeVueStoreFile();
-    this.extractOwnedObjectMembers(obj, owner.id, true, false);
+    this.extractOwnedObjectMembers(obj, owner.id, true, false, false, true);
     return true;
   }
 
@@ -3802,7 +3981,7 @@ export class TreeSitterExtractor {
     // bound `items$` and finds `items` inside it. Spelled in ASCII, as the
     // kernel spells it, since the kernel's `\w` is Unicode.
     const re = new RegExp(
-      `^[ \\t]*export\\s+(?:default\\s+${n}\\s*;?[ \\t]*$|\\{(?:[^}]*[^0-9A-Za-z_$}])?${n}(?:[^0-9A-Za-z_$}][^}]*)?\\})`,
+      `^[ \\t]*(?:export\\s+(?:default\\s+${n}\\s*;?[ \\t]*$|\\{(?:[^}]*[^0-9A-Za-z_$}])?${n}(?:[^0-9A-Za-z_$}][^}]*)?\\})|module\\.exports\\s*=\\s*${n}\\s*;?[ \\t]*$)`,
       'm'
     );
     return re.test(this.source);
@@ -4266,9 +4445,10 @@ export class TreeSitterExtractor {
             // the calls written in a member are the member's. The rest of the
             // literal is walked under the owner. (The same literal inside a
             // function or an IIFE goes through visitFunctionBody.)
-            const ownedObject = varNode ? this.ownedObjectValue(valueNode) : null;
+            const allowNestedObject = isExported || this.isExportedLater(name);
+            const ownedObject = varNode ? this.ownedObjectValue(valueNode, allowNestedObject) : null;
             if (varNode && ownedObject) {
-              this.extractOwnedObjectMembers(ownedObject, varNode.id, true, false);
+              this.extractOwnedObjectMembers(ownedObject, varNode.id, true, false, false, allowNestedObject);
               (walked ??= new Set()).add(ownedObject.id);
               continue;
             }
@@ -5252,6 +5432,7 @@ export class TreeSitterExtractor {
       if (!nameNode) return;
       const name = getNodeText(nameNode, this.source);
       if (!name) return;
+      this.importBindingNames.add(name);
       this.unresolvedReferences.push({
         fromNodeId,
         referenceName: name,

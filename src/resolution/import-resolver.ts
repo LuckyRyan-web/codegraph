@@ -9,7 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport } from './types';
-import { applyAliases, aliasAndBaseUrlCandidates } from './path-aliases';
+import { applyAliases, aliasAndBaseUrlCandidates, AliasMap, AliasPattern } from './path-aliases';
 import { extractLocalExportAliases } from './alias-binding';
 import { resolveWorkspaceImport, workspaceImportTargets, type WorkspaceImportTargets } from './workspace-packages';
 import { blankStringContents, stripCommentsForRegex, templateLiteralTextAt } from './strip-comments';
@@ -416,6 +416,9 @@ function exportedByName(filePath: string, idx: FileExportIndex, name: string, co
 /** Per context: an include path, by language → where the project's include directories find it. */
 const cppIncludeSearches = new WeakMap<ResolutionContext, Map<string, string | null>>();
 
+const webpackDirAliasMemos = new WeakMap<ResolutionContext, Map<string, AliasMap | null>>();
+const pkgBoundaryMemos = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
 /** Drop the per-context memo tables (see ReferenceResolver.clearCaches). */
 export function clearImportResolverMemos(context: ResolutionContext): void {
   importPathMemos.delete(context);
@@ -427,6 +430,112 @@ export function clearImportResolverMemos(context: ResolutionContext): void {
   PROJECT_FOLDER_SUFFIXES.delete(context);
   pythonModuleIndexes.delete(context);
   pythonStarExportMemos.delete(context);
+  webpackDirAliasMemos.delete(context);
+  pkgBoundaryMemos.delete(context);
+}
+
+/**
+ * Statically extract webpack / Vue CLI aliases from `vue.config.js` or
+ * `config.js` in `dirAbs` (no code execution). Supports:
+ *   - `alias.set('@common', path.join(__dirname, '/common'))`
+ *   - `{ key: '@', path: path.resolve(__dirname, './lib') }`
+ */
+function getWebpackDirectoryAliases(
+  dirRel: string,
+  projectRoot: string,
+  context: ResolutionContext
+): AliasMap | null {
+  let memo = webpackDirAliasMemos.get(context);
+  if (!memo) {
+    memo = new Map();
+    webpackDirAliasMemos.set(context, memo);
+  }
+  if (memo.has(dirRel)) return memo.get(dirRel) ?? null;
+
+  const dirAbs = dirRel ? path.join(projectRoot, dirRel) : projectRoot;
+  const patterns: AliasPattern[] = [];
+  const seen = new Set<string>();
+  const addAlias = (key: string, relTarget: string) => {
+    const cleanKey = key.replace(/\/+$/, '');
+    const cleanTarget = relTarget.replace(/^\/+/, './').replace(/\/+$/, '');
+    if (!cleanKey || !cleanTarget || cleanTarget.includes('node_modules')) return;
+    const wildcardPrefix = `${cleanKey}/`;
+    if (!seen.has(wildcardPrefix)) {
+      seen.add(wildcardPrefix);
+      patterns.push({
+        prefix: wildcardPrefix,
+        suffix: '',
+        hasWildcard: true,
+        replacements: [`${cleanTarget}/*`],
+      });
+    }
+    if (!seen.has(cleanKey)) {
+      seen.add(cleanKey);
+      patterns.push({
+        prefix: cleanKey,
+        suffix: '',
+        hasWildcard: false,
+        replacements: [cleanTarget],
+      });
+    }
+  };
+
+  for (const cfgName of ['vue.config.js', 'config.js']) {
+    const cfgPath = path.join(dirAbs, cfgName);
+    if (!fs.existsSync(cfgPath)) continue;
+    let src: string;
+    try {
+      src = fs.readFileSync(cfgPath, 'utf-8');
+    } catch {
+      continue;
+    }
+    const setRe = /\.alias\.set\(\s*['"]([^'"]+)['"]\s*,\s*path\.(?:join|resolve)\(\s*__dirname\s*,\s*['"`]([^'"`]+)['"`]\s*\)\s*\)/g;
+    let m: RegExpExecArray | null;
+    while ((m = setRe.exec(src)) !== null) {
+      addAlias(m[1]!, m[2]!);
+    }
+    const objRe = /\{\s*key\s*:\s*['"]([^'"]+)['"]\s*,\s*path\s*:\s*path\.(?:join|resolve)\(\s*__dirname\s*,\s*['"`]([^'"`]+)['"`]\s*\)\s*\}/g;
+    while ((m = objRe.exec(src)) !== null) {
+      addAlias(m[1]!, m[2]!);
+    }
+  }
+
+  let map: AliasMap | null = null;
+  if (patterns.length > 0) {
+    patterns.sort((a, b) => {
+      if (a.prefix.length !== b.prefix.length) return b.prefix.length - a.prefix.length;
+      if (a.hasWildcard !== b.hasWildcard) return a.hasWildcard ? 1 : -1;
+      return 0;
+    });
+    map = { baseUrl: dirAbs, patterns };
+  }
+  memo.set(dirRel, map);
+  return map;
+}
+
+function isPackageBoundaryDir(dirRel: string, projectRoot: string, context: ResolutionContext): boolean {
+  let memo = pkgBoundaryMemos.get(context);
+  if (!memo) {
+    memo = new Map();
+    pkgBoundaryMemos.set(context, memo);
+  }
+  const hit = memo.get(dirRel);
+  if (hit !== undefined) return hit;
+  const dirAbs = dirRel ? path.join(projectRoot, dirRel) : projectRoot;
+  const exists = fs.existsSync(path.join(dirAbs, 'package.json'));
+  memo.set(dirRel, exists);
+  return exists;
+}
+
+function ancestorDirsOf(fromFile: string): string[] {
+  const norm = fromFile.replace(/\\/g, '/');
+  const parts = norm.split('/');
+  parts.pop();
+  const dirs: string[] = [];
+  for (let i = parts.length; i >= 0; i--) {
+    dirs.push(parts.slice(0, i).join('/'));
+  }
+  return dirs;
 }
 
 export function resolveImportPath(
@@ -1329,6 +1438,19 @@ export function isExternalImport(
         if (pat.prefix !== '' && importPath.startsWith(pat.prefix)) return false;
       }
     }
+    // Ancestor webpack / Vue CLI aliases (`vue.config.js`, `config.js`) in monorepos
+    if (options.aliasPrefixes !== false && context && options.fromFile) {
+      const projectRoot = context.getProjectRoot();
+      for (const dirRel of ancestorDirsOf(options.fromFile)) {
+        const wAliases = getWebpackDirectoryAliases(dirRel, projectRoot, context);
+        if (!wAliases) continue;
+        for (const pat of wAliases.patterns) {
+          if (pat.hasWildcard ? importPath.startsWith(pat.prefix) : importPath === pat.prefix) {
+            return false;
+          }
+        }
+      }
+    }
     // Scoped packages or bare specifiers that don't start with aliases
     if (!importPath.startsWith('@/') && !importPath.startsWith('~/') && !importPath.startsWith('src/')) {
       // Likely an npm package
@@ -1531,6 +1653,19 @@ function resolveAliasedImport(
     }
   }
 
+  // 1.25 Ancestor webpack / Vue CLI aliases (`vue.config.js`, `config.js`),
+  //      nearest directory first.
+  const ancestors = fromFile ? ancestorDirsOf(fromFile) : [];
+  for (const dirRel of ancestors) {
+    const wAliases = getWebpackDirectoryAliases(dirRel, projectRoot, context);
+    if (!wAliases) continue;
+    const candidates = applyAliases(importPath, wAliases, projectRoot);
+    for (const c of candidates) {
+      const hit = tryWithExt(c);
+      if (hit) return hit;
+    }
+  }
+
   // 1.5 Workspace packages and path dependencies: the entry the package's
   //     manifest declares for the import (#2502), else the member's
   //     directory (`@scope/ui/widgets` → `packages/ui/widgets`), where the
@@ -1554,17 +1689,46 @@ function resolveAliasedImport(
     if (direct) return direct;
   }
 
+  // 1.75 Monorepo package-scoped `@/` and `~/` conventional resolution:
+  //      in a monorepo where `vue/packages/<pkg>/lib/...` (or `packages/<pkg>/src/...`)
+  //      uses `@/` to refer to its own package's `lib/` or `src/` root, resolve
+  //      relative to the enclosing source root / nearest package boundary.
+  if (fromFile && (importPath.startsWith('@/') || importPath.startsWith('~/'))) {
+    const rest = importPath.slice(2);
+    const normFrom = fromFile.replace(/\\/g, '/');
+    for (const dirRel of ancestors) {
+      if (!dirRel) break;
+      const base = dirRel.split('/').pop();
+      if (base === 'lib' || base === 'src') {
+        const hit = tryWithExt(`${dirRel}/${rest}`);
+        if (hit) return hit;
+      }
+      if (isPackageBoundaryDir(dirRel, projectRoot, context)) {
+        const subdirs = normFrom.startsWith(`${dirRel}/lib/`)
+          ? [`${dirRel}/lib/`, `${dirRel}/src/`, `${dirRel}/`]
+          : [`${dirRel}/src/`, `${dirRel}/lib/`, `${dirRel}/`];
+        for (const prefix of subdirs) {
+          const hit = tryWithExt(prefix + rest);
+          if (hit) return hit;
+        }
+        break;
+      }
+    }
+  }
+
   // 2. Hard-coded fallback list. Kept for projects that use these
   //    conventional aliases without declaring them in tsconfig.
-  const fallbackAliases: Record<string, string> = {
-    '@/': 'src/',
-    '~/': 'src/',
-    '@src/': 'src/',
-    'src/': 'src/',
-    '@app/': 'app/',
-    'app/': 'app/',
-  };
-  for (const [alias, replacement] of Object.entries(fallbackAliases)) {
+  const fallbackAliases: Array<[string, string]> = [
+    ['@/', 'src/'],
+    ['@/', 'lib/'],
+    ['~/', 'src/'],
+    ['~/', 'lib/'],
+    ['@src/', 'src/'],
+    ['src/', 'src/'],
+    ['@app/', 'app/'],
+    ['app/', 'app/'],
+  ];
+  for (const [alias, replacement] of fallbackAliases) {
     if (importPath.startsWith(alias)) {
       const hit = tryWithExt(importPath.replace(alias, replacement));
       if (hit) return hit;

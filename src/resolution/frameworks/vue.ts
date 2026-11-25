@@ -340,32 +340,47 @@ function isPascalCase(str: string): boolean {
 /**
  * Resolve a Vue component reference to its .vue file
  */
+function kebabToPascalStem(stem: string): string {
+  return stem
+    .split('-')
+    .map((p) => (p ? p[0]!.toUpperCase() + p.slice(1) : ''))
+    .join('');
+}
+
 function resolveComponent(
   name: string,
   fromFile: string,
   context: ResolutionContext
 ): string | null {
-  // Collect ALL basename matches first. The previous version returned the
-  // FIRST `Button.vue` found anywhere in the tree (its same-directory pass
-  // below was unreachable), so a multi-app monorepo with one `Button.vue`
-  // per app resolved to an arbitrary one (#764).
+  // Collect ALL basename matches first (both PascalCase `AdPlayable.vue` and
+  // kebab-case `ad-playable.vue`). The previous version returned the FIRST
+  // `Button.vue` found anywhere in the tree (#764).
   const matches: string[] = [];
   for (const file of context.getAllFiles()) {
     if (!file.endsWith('.vue')) continue;
     const fileName = file.split(/[/\\]/).pop() || '';
-    if (fileName.replace(/\.vue$/, '') === name) matches.push(file);
+    const stem = fileName.replace(/\.vue$/, '');
+    if (stem === name || kebabToPascalStem(stem) === name) matches.push(file);
   }
   if (matches.length === 0) return null;
 
   const componentIn = (file: string): string | null => {
     const nodes = context.getNodesInFile(file);
-    const component = nodes.find((n) => n.kind === 'component' && n.name === name);
+    const component = nodes.find((n) => n.kind === 'component');
     return component ? component.id : null;
   };
 
   // The referencing file's folder, or one below it, first for specificity
   const sameDir = inReferencingFolder(fromFile, matches, (f) => f);
   if (sameDir.length > 0) return componentIn(sameDir[0]!);
+
+  // Same monorepo package (`packages/<pkg>/`) before global uniqueness check
+  const pkgMatch = fromFile.replace(/\\/g, '/').match(/(?:^|\/)(?:packages|apps)\/([^/]+)\//);
+  if (pkgMatch) {
+    const pkgSeg = `/${pkgMatch[1]}/`;
+    const samePkg = matches.filter((f) => f.replace(/\\/g, '/').includes(pkgSeg));
+    if (samePkg.length === 1) return componentIn(samePkg[0]!);
+  }
 
   // No positional signal: only an UNAMBIGUOUS basename may resolve;
   // ambiguity falls through to the name-matcher's proximity scoring.
